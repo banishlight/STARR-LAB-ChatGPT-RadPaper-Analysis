@@ -10,6 +10,8 @@ structured JSON), but a single pass, one file, and no threads/polling/website.
 Usage:
     cp .env.example .env  # then fill in OPENAI_API_KEY
     python analyze_paper.py paper1.pdf [paper2.pdf ...]
+    python analyze_paper.py pdfs/                       # process every PDF in a folder
+    python analyze_paper.py pdfs/ --skip-existing        # skip PDFs already extracted
     python analyze_paper.py paper1.pdf --model gpt-4o --outdir results/
 """
 
@@ -271,18 +273,37 @@ def analyze_pdf(client: OpenAI, path: Path, model: str) -> dict:
     return {**metadata, "parts": parts}
 
 
+def collect_pdfs(paths: list[Path]) -> list[Path]:
+    pdfs = []
+    for path in paths:
+        if not path.exists():
+            print(f"error: {path} not found", file=sys.stderr)
+        elif path.is_dir():
+            found = sorted(p for p in path.iterdir() if p.suffix.lower() == ".pdf")
+            if not found:
+                print(f"warning: no PDFs found in {path}", file=sys.stderr)
+            pdfs.extend(found)
+        else:
+            pdfs.append(path)
+    return pdfs
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("pdfs", nargs="+", type=Path, help="PDF file(s) to analyze")
+    parser.add_argument("pdfs", nargs="+", type=Path, help="PDF file(s) and/or directories of PDFs to analyze")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenAI model to use (default: {DEFAULT_MODEL})")
     parser.add_argument("--outdir", type=Path, default=None, help="Directory for output JSON (default: next to each PDF)")
+    parser.add_argument("--skip-existing", action="store_true", help="Skip PDFs that already have an *_extracted.json output")
     args = parser.parse_args()
 
     client = OpenAI()  # reads OPENAI_API_KEY from the environment
 
-    for pdf_path in args.pdfs:
-        if not pdf_path.exists():
-            print(f"error: {pdf_path} not found", file=sys.stderr)
+    for pdf_path in collect_pdfs(args.pdfs):
+        outdir = args.outdir or pdf_path.parent
+        out_path = outdir / f"{pdf_path.stem}_extracted.json"
+
+        if args.skip_existing and out_path.exists():
+            print(f"[{pdf_path.name}] skipping, {out_path} already exists")
             continue
 
         try:
@@ -291,9 +312,7 @@ def main():
             print(f"[{pdf_path.name}] failed: {exc}", file=sys.stderr)
             continue
 
-        outdir = args.outdir or pdf_path.parent
         outdir.mkdir(parents=True, exist_ok=True)
-        out_path = outdir / f"{pdf_path.stem}_extracted.json"
         out_path.write_text(json.dumps(data, indent=2))
         print(f"[{pdf_path.name}] done -> {out_path}")
 
