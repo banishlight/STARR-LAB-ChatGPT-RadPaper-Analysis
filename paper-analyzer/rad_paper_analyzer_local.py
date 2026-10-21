@@ -91,7 +91,7 @@ Return this exact JSON structure (use null for missing values):
           "increased_power_usage": null,
           "power_usage_description": "string or null",
           "failing_time": "string or null",
-          "see_type": "SEU, SEL, SET, SEFI, etc. or null",
+          "see_type": "ONE code from the SEE type list below, or null",
           "amplitude": "string or null",
           "duration": "string or null",
           "cross_section_saturation": "string or null",
@@ -106,8 +106,26 @@ Return this exact JSON structure (use null for missing values):
   ]
 }
 
+SEE type list (use exactly these codes for "see_type"):
+  SEU   - Single Event Upset (single bit flip)
+  MBU   - Multiple Bit Upset (several bits in one word)
+  MCU   - Multiple Cell Upset (several cells, possibly different words)
+  SET   - Single Event Transient (voltage glitch; includes ASET/DSET)
+  SEFI  - Single Event Functional Interrupt (hang, reset, mode change)
+  SEL   - Single Event Latchup (high current, needs power cycle)
+  HCE   - High Current Event / micro-latchup
+  SESB  - Single Event Stuck Bit / Single Hard Error (SHE, SEHE)
+  SEB   - Single Event Burnout
+  SEGR  - Single Event Gate Rupture
+  SEDR  - Single Event Dielectric Rupture
+  SES   - Single Event Snapback
+  OTHER - an SEE not in this list (describe it in "special_notes")
+
 Rules:
 - One entry per component in "parts". One entry per test in "tests".
+- For SEE tests: make a SEPARATE test entry for EACH SEE type the paper
+  reports for that component (e.g. a part with SEU and SEL results gets two
+  SEE entries). Only list SEE types the paper actually observed or tested for.
 - Use null for values not found in the paper.
 - Return ONLY the JSON object. No other text.
 
@@ -190,7 +208,7 @@ def analyze_paper(
             response = client.chat.completions.create(
                 model=model,
                 temperature=0.1,
-                max_tokens=4096,
+                max_tokens=6144,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": EXTRACTION_PROMPT + text},
@@ -216,6 +234,39 @@ def analyze_paper(
                 print(f"    ✗ All {max_retries} attempts failed. Last error: {e}")
 
     return None
+
+
+SEE_CODES = {"SEU", "MBU", "MCU", "SET", "SEFI", "SEL", "HCE", "SESB",
+             "SEB", "SEGR", "SEDR", "SES", "OTHER"}
+
+SEE_ALIASES = {
+    "SBU": "SEU", "UPSET": "SEU", "SINGLE EVENT UPSET": "SEU", "BIT FLIP": "SEU",
+    "MULTIPLE BIT UPSET": "MBU", "MULTIPLE CELL UPSET": "MCU",
+    "ASET": "SET", "DSET": "SET", "TRANSIENT": "SET", "SINGLE EVENT TRANSIENT": "SET",
+    "FUNCTIONAL INTERRUPT": "SEFI", "SINGLE EVENT FUNCTIONAL INTERRUPT": "SEFI",
+    "LATCHUP": "SEL", "LATCH-UP": "SEL", "SINGLE EVENT LATCHUP": "SEL",
+    "SINGLE EVENT LATCH-UP": "SEL", "MICRO-LATCHUP": "HCE", "HIGH CURRENT EVENT": "HCE",
+    "SHE": "SESB", "SEHE": "SESB", "STUCK BIT": "SESB", "STUCKBIT": "SESB",
+    "STUCK BITS": "SESB", "HARD ERROR": "SESB", "SINGLE HARD ERROR": "SESB",
+    "BURNOUT": "SEB", "SINGLE EVENT BURNOUT": "SEB",
+    "GATE RUPTURE": "SEGR", "SINGLE EVENT GATE RUPTURE": "SEGR",
+    "DIELECTRIC RUPTURE": "SEDR", "SNAPBACK": "SES", "SESNAP": "SES",
+}
+
+
+def normalize_see_type(val) -> str:
+    """Map whatever the model wrote onto one of the standard SEE codes."""
+    if not val:
+        return ""
+    raw = str(val).strip().upper()
+    if raw in SEE_CODES:
+        return raw
+    if raw in SEE_ALIASES:
+        return SEE_ALIASES[raw]
+    # Model sometimes returns lists like "SEU, SEL" — normalize each piece
+    pieces = [p.strip() for p in re.split(r"[,/;]| and ", raw) if p.strip()]
+    mapped = [p if p in SEE_CODES else SEE_ALIASES.get(p, p) for p in pieces]
+    return ", ".join(dict.fromkeys(mapped))
 
 
 def safe(val) -> str:
@@ -295,7 +346,7 @@ def build_spreadsheet(results: list[dict], output_path: str):
         d = r["data"]
         for part in d.get("parts", []):
             for test in part.get("tests", []):
-                if test.get("test_type", "").upper() != "TID":
+                if (test.get("test_type") or "").upper() != "TID":
                     continue
                 tid_rows.append([
                     safe(d.get("paper_name")), d.get("year", ""),
@@ -322,12 +373,12 @@ def build_spreadsheet(results: list[dict], output_path: str):
         d = r["data"]
         for part in d.get("parts", []):
             for test in part.get("tests", []):
-                if test.get("test_type", "").upper() != "SEE":
+                if (test.get("test_type") or "").upper() != "SEE":
                     continue
                 see_rows.append([
                     safe(d.get("paper_name")), d.get("year", ""),
                     safe(part.get("name")), safe(test.get("source")),
-                    safe(test.get("see_type")), safe(test.get("max_fluence")),
+                    normalize_see_type(test.get("see_type")), safe(test.get("max_fluence")),
                     safe(test.get("energy_levels")),
                     safe(test.get("facility_name")), safe(test.get("environmental_conditions")),
                     safe(test.get("terrestrial")), safe(test.get("flight")),
@@ -351,7 +402,7 @@ def build_spreadsheet(results: list[dict], output_path: str):
         d = r["data"]
         for part in d.get("parts", []):
             for test in part.get("tests", []):
-                if test.get("test_type", "").upper() != "DD":
+                if (test.get("test_type") or "").upper() != "DD":
                     continue
                 dd_rows.append([
                     safe(d.get("paper_name")), d.get("year", ""),
