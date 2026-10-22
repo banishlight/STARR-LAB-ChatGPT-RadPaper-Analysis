@@ -23,6 +23,7 @@ at their endpoint.
 
 import os
 import sys
+import base64
 import json
 import glob
 import re
@@ -51,6 +52,10 @@ MODEL_RECOMMENDATIONS = """
 
 For best results with radiation paper extraction, qwen2.5:32b or qwen2.5:14b
 are recommended. They handle structured JSON output and technical content well.
+
+Figure digitizing (--figures) needs a vision model, set with --vision-model:
+  qwen2.5vl:7b   ~6 GB   good at reading charts (default)
+  gemma3:27b     ~17 GB  slower, also handles images
 """
 
 
@@ -133,6 +138,43 @@ Paper text:
 
 """
 
+FIGURE_PROMPT = """This image is a figure from a radiation-effects research paper.
+
+Caption: {caption}
+Components studied in the paper: {parts}
+
+Return this exact JSON structure (use null for missing values):
+
+{{
+  "kind": "data_plot or diagram or photo or table or other",
+  "title": "string or null",
+  "x_axis": {{"label": "string", "unit": "string or null", "scale": "linear or log"}},
+  "y_axis": {{"label": "string", "unit": "string or null", "scale": "linear or log"}},
+  "series": [
+    {{"label": "legend entry or description", "points": [[0.0, 0.0]]}}
+  ],
+  "related_part": "which component above the figure is about, or null",
+  "notes": "string or null"
+}}
+
+Rules:
+- Only fill "series" when kind is "data_plot". Otherwise use an empty list.
+- Read values from the axis tick labels. On a log axis, interpolate in log space.
+- Write numbers as plain numbers, e.g. 2e-3 not "2.E-03".
+- One series per legend entry. For markers, give every marker. For lines,
+  give 10-20 points including the endpoints and any bends.
+- For multi-panel figures, prefix each series label with its panel, e.g. "(a) SEU".
+- Return ONLY the JSON object. No other text.
+"""
+
+# Matches captions like "Figure 3.", "Fig. 3:", "FIGURE 3 -"
+CAPTION_RE = re.compile(r"^\s*(?:fig\.?|figure)\s*(\d+)\s*[.:\-–—]?\s*", re.I)
+
+REFERENCES_RE = re.compile(
+    r"^\s*(?:[0-9IVX]+\.?\s*)?(?:references|bibliography|reference list)\s*$",
+    re.I | re.M,
+)
+
 
 def extract_text_from_pdf(pdf_path: str) -> str:
     """Extract text from a PDF using PyMuPDF."""
@@ -142,6 +184,117 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         text_parts.append(page.get_text())
     doc.close()
     return "\n".join(text_parts)
+
+
+def strip_references(text: str) -> str:
+    """Drop the reference list so the context budget goes to the paper body."""
+    matches = [m for m in REFERENCES_RE.finditer(text) if m.start() > len(text) * 0.4]
+    if not matches:
+        return text
+    return text[: matches[-1].start()]
+
+
+def _graphic_regions(page) -> list:
+    """Bounding boxes of images and vector drawings big enough to be figures."""
+    page_area = page.rect.get_area()
+    rects = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()]
+    # Ignore page-sized background shapes (common in slide decks) before clustering
+    drawings = [d for d in page.get_drawings() if d["rect"].get_area() < 0.5 * page_area]
+    if drawings:
+        rects += [pymupdf.Rect(r) for r in page.cluster_drawings(drawings=drawings)]
+    rects = [r & page.rect for r in rects]
+    rects = [r for r in rects if r.width > 40 and r.height > 40 and r.get_area() > 0.02 * page_area]
+
+    # Merge regions that touch or nearly touch (multi-panel figures)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(rects)):
+            for j in range(i + 1, len(rects)):
+                if (rects[i] + (-25, -25, 25, 25)).intersects(rects[j]):
+                    rects[i] |= rects.pop(j)
+                    merged = True
+                    break
+            if merged:
+                break
+    return rects
+
+
+def extract_figures(pdf_path: str, out_dir: Path, dpi: int = 200) -> list[dict]:
+    """Find figures by pairing graphic regions with their captions, save as PNGs."""
+    doc = pymupdf.open(pdf_path)
+    found = []
+    for pno, page in enumerate(doc, 1):
+        regions = _graphic_regions(page)
+        if not regions:
+            continue
+        caps = []
+        for b in page.get_text("blocks"):
+            if b[6] == 0 and (m := CAPTION_RE.match(b[4])):
+                caps.append((pymupdf.Rect(b[:4]), m.group(1), " ".join(b[4].split())[:500]))
+
+        # A caption inside a region means the region swallowed the caption (and
+        # maybe content below it); the figure is the part above the caption.
+        split = []
+        while regions:
+            r = regions.pop()
+            inside = [c for c in caps if r.contains((c[0].tl + c[0].br) / 2)]
+            if not inside:
+                split.append(r)
+                continue
+            top = min(inside, key=lambda c: c[0].y0)[0]
+            above = pymupdf.Rect(r.x0, r.y0, r.x1, top.y0)
+            below = pymupdf.Rect(r.x0, top.y1, r.x1, r.y1)
+            if above.height > 40:
+                split.append(above)
+            if below.height > 40:
+                regions.append(below)
+
+        # Assign each region to the nearest caption, preferring captions below
+        groups = {}
+        for r in split:
+            best, best_d = None, page.rect.height / 3
+            for idx, (crect, _, _) in enumerate(caps):
+                if crect.y0 >= r.y1 - 20:
+                    d = max(crect.y0 - r.y1, 0)
+                elif crect.y1 <= r.y0 + 20:
+                    d = (r.y0 - crect.y1) * 1.5
+                else:
+                    continue
+                if d < best_d:
+                    best, best_d = idx, d
+            groups.setdefault(best, []).append(r)
+
+        for idx, rs in groups.items():
+            if idx is None:
+                # Uncaptioned graphics (e.g. plots on slides) — keep only large ones
+                for r in rs:
+                    if r.get_area() > 0.08 * page.rect.get_area():
+                        found.append((pno, None, "", r))
+                continue
+            rect = rs[0]
+            for r in rs[1:]:
+                rect |= r
+            found.append((pno, caps[idx][1], caps[idx][2], rect))
+
+    figures = []
+    if found:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    seen_ids = set()
+    for k, (pno, num, caption, rect) in enumerate(found, 1):
+        page = doc[pno - 1]
+        clip = (rect + (-18, -18, 18, 18)) & page.rect   # padding keeps axis labels
+        fig_id = f"fig{num}" if num else f"p{pno}_img{k}"
+        if fig_id in seen_ids:
+            fig_id = f"{fig_id}_{k}"
+        seen_ids.add(fig_id)
+        # Cap the long side at ~1600 px so vision models don't choke on huge images
+        scale = min(dpi, 1600 * 72 / max(clip.width, clip.height))
+        path = out_dir / f"{fig_id}_p{pno}.png"
+        page.get_pixmap(clip=clip, dpi=int(scale)).save(path)
+        figures.append({"figure_id": fig_id, "page": pno, "caption": caption, "image_path": str(path)})
+    doc.close()
+    return figures
 
 
 def extract_json_from_response(text: str) -> dict | None:
@@ -203,21 +356,77 @@ def analyze_paper(
     if len(text) > max_chars:
         text = text[:max_chars] + "\n\n[Paper truncated due to context length limits]"
 
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": EXTRACTION_PROMPT + text},
+    ]
+    return request_json(client, model, messages, "parts", max_retries, timeout, max_tokens=6144)
+
+
+def digitize_figure(
+    client: OpenAI,
+    figure: dict,
+    part_names: list[str],
+    model: str,
+    max_retries: int = 3,
+    timeout: float = 300,
+) -> dict | None:
+    """Ask a vision model to classify a figure and read the data points off it."""
+    with open(figure["image_path"], "rb") as f:
+        image_b64 = base64.b64encode(f.read()).decode()
+    prompt = FIGURE_PROMPT.format(
+        caption=figure["caption"] or "(none)",
+        parts=", ".join(part_names) or "(unknown)",
+    )
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+        ]},
+    ]
+    data = request_json(client, model, messages, "kind", max_retries, timeout, max_tokens=4096)
+    if data is None:
+        return None
+
+    # Keep only points the spreadsheet/database can use as numbers
+    clean_series = []
+    for s in data.get("series") or []:
+        if not isinstance(s, dict):
+            continue
+        points = []
+        for p in s.get("points") or []:
+            try:
+                points.append([float(p[0]), float(p[1])])
+            except (TypeError, ValueError, IndexError):
+                continue
+        clean_series.append({"label": safe(s.get("label")), "points": points})
+    data["series"] = clean_series
+    return data
+
+
+def request_json(
+    client: OpenAI,
+    model: str,
+    messages: list[dict],
+    required_key: str,
+    max_retries: int,
+    timeout: float,
+    max_tokens: int,
+) -> dict | None:
+    """Call the model until it returns a JSON object containing required_key."""
     for attempt in range(1, max_retries + 1):
         try:
             response = client.chat.completions.create(
                 model=model,
                 temperature=0.1,
-                max_tokens=6144,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": EXTRACTION_PROMPT + text},
-                ],
+                max_tokens=max_tokens,
+                messages=messages,
                 timeout=timeout,
             )
             content = response.choices[0].message.content
             data = extract_json_from_response(content)
-            if data and "parts" in data:
+            if isinstance(data, dict) and required_key in data:
                 return data
             if attempt < max_retries:
                 print(f"    ⚠ Attempt {attempt}: got response but JSON was invalid, retrying...")
@@ -441,8 +650,52 @@ def build_spreadsheet(results: list[dict], output_path: str):
         "Terrestrial", "Flight", "Notes",
     ], flat_rows)
 
+    data_sheets = [ws_tid, ws_see, ws_dd, ws_all]
+
+    # ── Figures / Figure Data (only when figures were extracted) ──
+    if any(r.get("figures") for r in results):
+        ws_figs = wb.create_sheet("Figures")
+        fig_rows, point_rows = [], []
+        for r in results:
+            d = r["data"]
+            for fig in r.get("figures", []):
+                a = fig.get("analysis") or {}
+                x, y = a.get("x_axis") or {}, a.get("y_axis") or {}
+                series = a.get("series", [])
+                fig_rows.append([
+                    safe(d.get("paper_name")), fig["figure_id"], fig["page"],
+                    fig["caption"], safe(a.get("kind")), safe(a.get("related_part")),
+                    safe(x.get("label")), safe(x.get("unit")), safe(x.get("scale")),
+                    safe(y.get("label")), safe(y.get("unit")), safe(y.get("scale")),
+                    len(series), sum(len(s["points"]) for s in series),
+                    safe(a.get("notes")), fig["image_path"],
+                ])
+                for s in series:
+                    for px, py in s["points"]:
+                        point_rows.append([
+                            safe(d.get("paper_name")), fig["figure_id"],
+                            safe(a.get("related_part")), s["label"],
+                            px, safe(x.get("label")), safe(x.get("unit")),
+                            py, safe(y.get("label")), safe(y.get("unit")),
+                        ])
+        write_sheet(ws_figs, [
+            "Paper", "Figure", "Page", "Caption", "Kind", "Related Part",
+            "X Label", "X Unit", "X Scale", "Y Label", "Y Unit", "Y Scale",
+            "# Series", "# Points", "Notes", "Image",
+        ], fig_rows)
+        # Make the image path clickable
+        for row in ws_figs.iter_rows(min_row=2, min_col=16, max_col=16):
+            row[0].hyperlink = row[0].value
+
+        ws_points = wb.create_sheet("Figure Data")
+        write_sheet(ws_points, [
+            "Paper", "Figure", "Related Part", "Series",
+            "X", "X Label", "X Unit", "Y", "Y Label", "Y Unit",
+        ], point_rows)
+        data_sheets += [ws_figs, ws_points]
+
     # Set default column widths on data sheets
-    for ws in [ws_tid, ws_see, ws_dd, ws_all]:
+    for ws in data_sheets:
         for col_letter in [chr(c) for c in range(ord("A"), ord("A") + ws.max_column)]:
             ws.column_dimensions[col_letter].width = 16
 
@@ -461,6 +714,60 @@ def check_ollama_running(base_url: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def save_progress(progress_dir: Path, entry: dict):
+    safe_name = entry["filename"].replace(".pdf", ".json")
+    with open(progress_dir / safe_name, "w") as f:
+        json.dump(entry, f, indent=2)
+
+
+def process_figures(client: OpenAI, results: list[dict], pdf_files: list[str], args, progress_dir: Path):
+    """Second pass: extract figures and digitize plots for every analyzed paper.
+
+    Runs after all text extraction so Ollama only swaps to the vision model once.
+    Progress is saved per paper, so interrupted runs resume where they left off.
+    """
+    pdf_by_name = {os.path.basename(p): p for p in pdf_files}
+    todo = [r for r in results if r["filename"] in pdf_by_name]
+    print()
+    print(f"Figure pass: {len(todo)} paper(s)")
+
+    for i, entry in enumerate(todo, 1):
+        filename = entry["filename"]
+        changed = False
+        if "figures" not in entry:
+            out_dir = Path(args.figures_dir) / Path(filename).stem
+            try:
+                entry["figures"] = extract_figures(pdf_by_name[filename], out_dir)
+            except Exception as e:
+                print(f"[{i}/{len(todo)}] {filename}: ✗ figure extraction failed: {e}")
+                continue
+            changed = True
+
+        pending = [] if args.no_digitize else [f for f in entry["figures"] if "analysis" not in f]
+        if changed or pending:
+            print(f"[{i}/{len(todo)}] {filename}: {len(entry['figures'])} figure(s)")
+        part_names = [safe(p.get("name")) for p in entry["data"].get("parts", [])]
+        for fig in pending:
+            t0 = time.time()
+            analysis = digitize_figure(
+                client, fig, part_names, args.vision_model,
+                max_retries=args.retries, timeout=args.timeout,
+            )
+            if analysis is None:
+                print(f"    ✗ {fig['figure_id']}: could not read figure")
+                continue
+            fig["analysis"] = analysis
+            changed = True
+            n_points = sum(len(s["points"]) for s in analysis["series"])
+            print(f"    ✓ {fig['figure_id']} ({analysis.get('kind')}): "
+                  f"{len(analysis['series'])} series, {n_points} points in {time.time() - t0:.0f}s")
+            # Save after each figure — vision calls are slow
+            save_progress(progress_dir, entry)
+
+        if changed:
+            save_progress(progress_dir, entry)
 
 
 def main():
@@ -510,6 +817,22 @@ def main():
         help="Start fresh, ignoring any saved progress",
     )
     parser.add_argument(
+        "--figures", action="store_true",
+        help="Also extract figures from each paper and digitize plots with --vision-model",
+    )
+    parser.add_argument(
+        "--vision-model", default="qwen2.5vl:7b",
+        help="Vision model used to read data off figures (default: qwen2.5vl:7b)",
+    )
+    parser.add_argument(
+        "--no-digitize", action="store_true",
+        help="With --figures, only save figure images; skip the vision model",
+    )
+    parser.add_argument(
+        "--figures-dir", default="figures",
+        help="Directory for extracted figure images (default: figures)",
+    )
+    parser.add_argument(
         "--show-models", action="store_true",
         help="Show recommended models for 24 GB VRAM and exit",
     )
@@ -552,6 +875,9 @@ def main():
     print(f"  PDFs:      {len(pdf_files)} papers in {pdf_dir}/")
     print(f"  Max chars: {args.max_chars:,} (~{args.max_chars // 4:,} tokens)")
     print(f"  Retries:   {args.retries}")
+    if args.figures:
+        print(f"  Figures:   {args.figures_dir}/ "
+              f"({'images only' if args.no_digitize else 'digitize with ' + args.vision_model})")
     print(f"  Output:    {args.output}")
     print()
 
@@ -602,8 +928,14 @@ def main():
             continue
 
         print(f"    Extracted {len(text):,} chars ({len(text) // 4:,} est. tokens)")
-        if len(text) > args.max_chars:
-            print(f"    Truncating to {args.max_chars:,} chars to fit context window")
+        body = strip_references(text)
+        if len(body) < len(text):
+            print(f"    Dropped reference list ({len(text) - len(body):,} chars)")
+            text = body
+        truncated_chars = max(len(text) - args.max_chars, 0)
+        if truncated_chars:
+            print(f"    ⚠ Truncating to {args.max_chars:,} chars — "
+                  f"last {truncated_chars:,} chars ({truncated_chars * 100 // len(text)}%) not sent")
 
         # Analyze
         print(f"    Sending to {args.model}...")
@@ -624,18 +956,19 @@ def main():
         tests_count = sum(len(p.get("tests", [])) for p in data.get("parts", []))
         print(f"    ✓ Done in {elapsed:.1f}s — {parts_count} component(s), {tests_count} test(s)")
 
-        entry = {"filename": filename, "data": data}
+        entry = {"filename": filename, "data": data, "truncated_chars": truncated_chars}
         results.append(entry)
 
         # Save progress immediately so we can resume
-        safe_name = filename.replace(".pdf", ".json")
-        with open(progress_dir / safe_name, "w") as f:
-            json.dump(entry, f, indent=2)
+        save_progress(progress_dir, entry)
 
         if args.dump_json:
             json_path = pdf_path.replace(".pdf", "_extracted.json")
             with open(json_path, "w") as f:
                 json.dump(data, f, indent=2)
+
+    if args.figures:
+        process_figures(client, results, pdf_files, args, progress_dir)
 
     print()
     if not results:

@@ -3,3 +3,4 @@ __pycache__/
 .env
 *_extracted.json
 pdfs/
+figures/
