@@ -28,7 +28,9 @@ import json
 import glob
 import re
 import time
+import shutil
 import argparse
+from collections import Counter
 from pathlib import Path
 
 import pymupdf
@@ -167,6 +169,9 @@ Rules:
 - Return ONLY the JSON object. No other text.
 """
 
+# Bump when extract_figures changes so saved papers get their figures re-cropped
+FIGURES_VERSION = 2
+
 # Matches captions like "Figure 3.", "Fig. 3:", "FIGURE 3 -"
 CAPTION_RE = re.compile(r"^\s*(?:fig\.?|figure)\s*(\d+)\s*[.:\-–—]?\s*", re.I)
 
@@ -194,16 +199,29 @@ def strip_references(text: str) -> str:
     return text[: matches[-1].start()]
 
 
-def _graphic_regions(page) -> list:
+def _image_key(info: dict):
+    # Same embedded image (xref) or same placement on the page
+    return ("img", info["xref"]) if info["xref"] else ("img", tuple(round(v) for v in info["bbox"]))
+
+
+def _drawing_key(d: dict):
+    return ("draw", tuple(round(v) for v in d["rect"]))
+
+
+def _graphic_regions(page, images: list[dict], drawings: list[dict], template: set) -> list:
     """Bounding boxes of images and vector drawings big enough to be figures."""
     page_area = page.rect.get_area()
-    rects = [pymupdf.Rect(i["bbox"]) for i in page.get_image_info()]
+    # Skip template decoration (slide sidebars, logos, header bars) that repeats across pages
+    rects = [pymupdf.Rect(i["bbox"]) for i in images if _image_key(i) not in template]
     # Ignore page-sized background shapes (common in slide decks) before clustering
-    drawings = [d for d in page.get_drawings() if d["rect"].get_area() < 0.5 * page_area]
+    drawings = [d for d in drawings
+                if d["rect"].get_area() < 0.5 * page_area and _drawing_key(d) not in template]
     if drawings:
         rects += [pymupdf.Rect(r) for r in page.cluster_drawings(drawings=drawings)]
     rects = [r & page.rect for r in rects]
     rects = [r for r in rects if r.width > 40 and r.height > 40 and r.get_area() > 0.02 * page_area]
+    # Long thin strips are banners/title art/sidebars, not figures
+    rects = [r for r in rects if max(r.width / r.height, r.height / r.width) < 6]
 
     # Merge regions that touch or nearly touch (multi-panel figures)
     merged = True
@@ -223,9 +241,17 @@ def _graphic_regions(page) -> list:
 def extract_figures(pdf_path: str, out_dir: Path, dpi: int = 200) -> list[dict]:
     """Find figures by pairing graphic regions with their captions, save as PNGs."""
     doc = pymupdf.open(pdf_path)
+    page_graphics = [(page.get_image_info(xrefs=True), page.get_drawings()) for page in doc]
+
+    # Anything appearing on 3+ pages and at least 30% of pages is page template
+    counts = Counter()
+    for images, drawings in page_graphics:
+        counts.update({_image_key(i) for i in images} | {_drawing_key(d) for d in drawings})
+    template = {k for k, c in counts.items() if c >= 3 and c >= 0.3 * len(doc)}
+
     found = []
     for pno, page in enumerate(doc, 1):
-        regions = _graphic_regions(page)
+        regions = _graphic_regions(page, *page_graphics[pno - 1], template)
         if not regions:
             continue
         caps = []
@@ -731,23 +757,35 @@ def process_figures(client: OpenAI, results: list[dict], pdf_files: list[str], a
     pdf_by_name = {os.path.basename(p): p for p in pdf_files}
     todo = [r for r in results if r["filename"] in pdf_by_name]
     print()
-    print(f"Figure pass: {len(todo)} paper(s)")
+    print(f"Figure extraction: {len(todo)} paper(s) → {args.figures_dir}/")
 
+    # Step 1: crop figures for every paper (fast) so they can be reviewed early.
+    # Papers cropped by an older version of extract_figures are redone.
     for i, entry in enumerate(todo, 1):
         filename = entry["filename"]
-        changed = False
-        if "figures" not in entry:
-            out_dir = Path(args.figures_dir) / Path(filename).stem
-            try:
-                entry["figures"] = extract_figures(pdf_by_name[filename], out_dir)
-            except Exception as e:
-                print(f"[{i}/{len(todo)}] {filename}: ✗ figure extraction failed: {e}")
-                continue
-            changed = True
+        if entry.get("figures_version") == FIGURES_VERSION:
+            continue
+        out_dir = Path(args.figures_dir) / Path(filename).stem
+        shutil.rmtree(out_dir, ignore_errors=True)
+        try:
+            entry["figures"] = extract_figures(pdf_by_name[filename], out_dir)
+        except Exception as e:
+            print(f"[{i}/{len(todo)}] {filename}: ✗ figure extraction failed: {e}")
+            continue
+        entry["figures_version"] = FIGURES_VERSION
+        save_progress(progress_dir, entry)
+        print(f"[{i}/{len(todo)}] {filename}: {len(entry['figures'])} figure(s)")
 
-        pending = [] if args.no_digitize else [f for f in entry["figures"] if "analysis" not in f]
-        if changed or pending:
-            print(f"[{i}/{len(todo)}] {filename}: {len(entry['figures'])} figure(s)")
+    if args.no_digitize:
+        return
+
+    # Step 2: digitize with the vision model
+    todo = [r for r in todo if any("analysis" not in f for f in r.get("figures", []))]
+    print()
+    print(f"Digitizing figures with {args.vision_model}: {len(todo)} paper(s)")
+    for i, entry in enumerate(todo, 1):
+        pending = [f for f in entry["figures"] if "analysis" not in f]
+        print(f"[{i}/{len(todo)}] {entry['filename']}: {len(pending)} figure(s)")
         part_names = [safe(p.get("name")) for p in entry["data"].get("parts", [])]
         for fig in pending:
             t0 = time.time()
@@ -759,14 +797,10 @@ def process_figures(client: OpenAI, results: list[dict], pdf_files: list[str], a
                 print(f"    ✗ {fig['figure_id']}: could not read figure")
                 continue
             fig["analysis"] = analysis
-            changed = True
             n_points = sum(len(s["points"]) for s in analysis["series"])
             print(f"    ✓ {fig['figure_id']} ({analysis.get('kind')}): "
                   f"{len(analysis['series'])} series, {n_points} points in {time.time() - t0:.0f}s")
             # Save after each figure — vision calls are slow
-            save_progress(progress_dir, entry)
-
-        if changed:
             save_progress(progress_dir, entry)
 
 
@@ -884,7 +918,6 @@ def main():
     # Set up progress directory for resume support
     progress_dir = Path(args.progress_dir)
     if args.no_resume and progress_dir.exists():
-        import shutil
         shutil.rmtree(progress_dir)
         print("  Cleared previous progress.\n")
     progress_dir.mkdir(exist_ok=True)
