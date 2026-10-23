@@ -4,7 +4,8 @@ STARR-LAB Radiation Paper Database Viewer
 =========================================
 Serves the spreadsheet made by rad_paper_analyzer_local.py as a web page:
 one tab per sheet, with search, sorting, paging, and links to each paper's
-PDF (and to extracted figure images).
+PDF (and to extracted figure images). The spreadsheet itself can be
+downloaded from the page.
 
 Requirements:
     pip install openpyxl
@@ -137,12 +138,19 @@ def make_handler(db: Database, pdf_dir: Path, figures_dir: Path):
         def send_json(self, data, status=200):
             self.send_body(status, json.dumps(data, default=str).encode(), "application/json")
 
-        def send_file(self, path: Path | None):
+        def send_file(self, path: Path | None, download: bool = False):
             if path is None:
                 self.send_body(404, b"Not found", "text/plain")
                 return
             ctype = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            self.send_body(200, path.read_bytes(), ctype)
+            body = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            if download:
+                self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_GET(self):
             url = urlparse(self.path)
@@ -163,6 +171,8 @@ def make_handler(db: Database, pdf_dir: Path, figures_dir: Path):
                     if "pdfs" in result:
                         result["pdfs"] = [f if f and safe_file(pdf_dir, f) else None for f in result["pdfs"]]
                     self.send_json(result)
+                elif url.path == "/download":
+                    self.send_file(db.xlsx_path, download=True)
                 elif url.path.startswith("/pdf/"):
                     self.send_file(safe_file(pdf_dir, unquote(url.path[len("/pdf/"):])))
                 elif url.path.startswith("/figures/"):
@@ -194,6 +204,7 @@ PAGE_HTML = """<!doctype html>
   body { margin:0; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
   header { padding:16px; display:flex; flex-wrap:wrap; gap:12px; align-items:center; border-bottom:1px solid var(--line); }
   h1 { font-size:18px; margin:0 12px 0 0; }
+  #download { margin-left:auto; white-space:nowrap; }
   #tabs { display:flex; flex-wrap:wrap; gap:4px; }
   #tabs button { border:1px solid var(--line); background:var(--bg); color:var(--fg); padding:6px 10px;
                  border-radius:6px; cursor:pointer; font:inherit; }
@@ -217,7 +228,8 @@ PAGE_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-<header><h1>Radiation Paper Database</h1><div id="tabs"></div></header>
+<header><h1>Radiation Paper Database</h1><div id="tabs"></div>
+  <a id="download" href="download">Download spreadsheet (.xlsx)</a></header>
 <div class="bar">
   <input id="q" type="search" placeholder="Search this sheet (all words must match)">
   <span id="status"></span>
