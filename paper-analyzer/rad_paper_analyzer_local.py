@@ -106,6 +106,17 @@ Return this exact JSON structure (use null for missing values):
           "cross_section_type": "string or null",
           "damage_level": "string or null",
           "damage_description": "string or null",
+          "parametrics": [
+            {
+              "parameter": "ONE code from the parametric list below",
+              "label": "parameter name as written in the paper",
+              "pre": "value before irradiation, with unit, or null",
+              "post": "value after irradiation, with unit, or null",
+              "at_dose": "dose or fluence of the post value, or null",
+              "spec_limit": "datasheet/spec limit, or null",
+              "notes": "string or null"
+            }
+          ],
           "special_notes": "string or null"
         }
       ]
@@ -128,11 +139,25 @@ SEE type list (use exactly these codes for "see_type"):
   SES   - Single Event Snapback
   OTHER - an SEE not in this list (describe it in "special_notes")
 
+Parametric list (use exactly these codes for "parameter"):
+  IBIAS   - input bias current (op-amps, comparators, bipolar parts)
+  BETA    - transistor current gain (beta, hFE)
+  INL     - integral nonlinearity (ADCs, DACs)
+  DNL     - differential nonlinearity (ADCs, DACs)
+  ISUPPLY - supply current (Icc, Idd, quiescent current)
+  VOUT    - output voltage (regulators, references, VOH/VOL)
+  OTHER   - any other measured electrical parameter shift (offset voltage,
+            leakage current, ...); name it in "label"
+
 Rules:
 - One entry per component in "parts". One entry per test in "tests".
 - For SEE tests: make a SEPARATE test entry for EACH SEE type the paper
   reports for that component (e.g. a part with SEU and SEL results gets two
   SEE entries). Only list SEE types the paper actually observed or tested for.
+- "parametrics": one entry per electrical parameter the paper reports a
+  value or shift for under irradiation. If several doses are reported, give
+  the highest dose as "post" and mention the others in "notes". Use [] if
+  the paper reports none.
 - Use null for values not found in the paper.
 - Return ONLY the JSON object. No other text.
 
@@ -386,7 +411,7 @@ def analyze_paper(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": EXTRACTION_PROMPT + text},
     ]
-    return request_json(client, model, messages, "parts", max_retries, timeout, max_tokens=6144)
+    return request_json(client, model, messages, "parts", max_retries, timeout, max_tokens=8192)
 
 
 def digitize_figure(
@@ -502,6 +527,27 @@ def normalize_see_type(val) -> str:
     pieces = [p.strip() for p in re.split(r"[,/;]| and ", raw) if p.strip()]
     mapped = [p if p in SEE_CODES else SEE_ALIASES.get(p, p) for p in pieces]
     return ", ".join(dict.fromkeys(mapped))
+
+
+PARAMETRIC_CODES = {"IBIAS", "BETA", "INL", "DNL", "ISUPPLY", "VOUT", "OTHER"}
+
+PARAMETRIC_ALIASES = {
+    "IB": "IBIAS", "I_BIAS": "IBIAS", "BIAS CURRENT": "IBIAS", "INPUT BIAS CURRENT": "IBIAS",
+    "HFE": "BETA", "GAIN": "BETA", "CURRENT GAIN": "BETA", "Β": "BETA",
+    "INTEGRAL NONLINEARITY": "INL", "INTEGRAL NON-LINEARITY": "INL",
+    "DIFFERENTIAL NONLINEARITY": "DNL", "DIFFERENTIAL NON-LINEARITY": "DNL",
+    "ICC": "ISUPPLY", "IDD": "ISUPPLY", "IQ": "ISUPPLY", "SUPPLY CURRENT": "ISUPPLY",
+    "POWER SUPPLY CURRENT": "ISUPPLY", "QUIESCENT CURRENT": "ISUPPLY",
+    "VO": "VOUT", "V_OUT": "VOUT", "VOH": "VOUT", "VOL": "VOUT", "OUTPUT VOLTAGE": "VOUT",
+}
+
+
+def normalize_parametric(val) -> str:
+    """Map whatever the model wrote onto one of the standard parametric codes."""
+    raw = safe(val).strip().upper()
+    if raw in PARAMETRIC_CODES:
+        return raw
+    return PARAMETRIC_ALIASES.get(raw, "OTHER" if raw else "")
 
 
 def safe(val) -> str:
@@ -676,7 +722,31 @@ def build_spreadsheet(results: list[dict], output_path: str):
         "Terrestrial", "Flight", "Notes",
     ], flat_rows)
 
-    data_sheets = [ws_tid, ws_see, ws_dd, ws_all]
+    # ── Parametric Data ──
+    ws_param = wb.create_sheet("Parametric Data")
+    param_rows = []
+    for r in results:
+        d = r["data"]
+        for part in d.get("parts", []):
+            for test in part.get("tests", []):
+                for p in test.get("parametrics") or []:
+                    if not isinstance(p, dict):
+                        continue
+                    param_rows.append([
+                        safe(d.get("paper_name")), d.get("year", ""),
+                        safe(part.get("name")), safe(part.get("type")),
+                        safe(test.get("test_type")),
+                        normalize_parametric(p.get("parameter")), safe(p.get("label")),
+                        safe(p.get("pre")), safe(p.get("post")), safe(p.get("at_dose")),
+                        safe(p.get("spec_limit")), safe(p.get("notes")),
+                    ])
+    write_sheet(ws_param, [
+        "Paper", "Year", "Part", "Part Type", "Test Type",
+        "Parameter", "Label in Paper", "Pre-Rad", "Post-Rad", "At Dose/Fluence",
+        "Spec Limit", "Notes",
+    ], param_rows)
+
+    data_sheets = [ws_tid, ws_see, ws_dd, ws_all, ws_param]
 
     # ── Figures / Figure Data (only when figures were extracted) ──
     if any(r.get("figures") for r in results):
