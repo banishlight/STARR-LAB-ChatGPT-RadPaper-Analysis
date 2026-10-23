@@ -612,12 +612,12 @@ def build_spreadsheet(results: list[dict], output_path: str):
             part_rows.append([
                 safe(d.get("paper_name")), d.get("year", ""),
                 safe(part.get("name")), safe(part.get("type")),
-                safe(part.get("manufacturer")), safe(part.get("other_details")),
+                safe(part.get("manufacturer")), safe(part.get("other_details")), r["filename"],
             ])
     write_sheet(ws_parts,
-        ["Paper Name", "Year", "Part Name", "Type", "Manufacturer", "Other Details"],
+        ["Paper Name", "Year", "Part Name", "Type", "Manufacturer", "Other Details", "Source File"],
         part_rows)
-    for col, w in zip("ABCDEF", [35, 8, 25, 20, 20, 30]):
+    for col, w in zip("ABCDEFG", [35, 8, 25, 20, 20, 30, 25]):
         ws_parts.column_dimensions[col].width = w
 
     # ── TID Data ──
@@ -638,13 +638,13 @@ def build_spreadsheet(results: list[dict], output_path: str):
                     safe(test.get("max_tid")), safe(test.get("dose_rate")),
                     safe(test.get("eldrs")), safe(test.get("dose_to_failure")),
                     safe(test.get("increased_power_usage")), safe(test.get("power_usage_description")),
-                    safe(test.get("failing_time")), safe(test.get("special_notes")),
+                    safe(test.get("failing_time")), safe(test.get("special_notes")), r["filename"],
                 ])
     write_sheet(ws_tid, [
         "Paper", "Year", "Part", "Source", "Max Fluence", "Energy",
         "Facility", "Environment", "Terrestrial", "Flight",
         "Max TID", "Dose Rate", "ELDRS", "Dose to Failure",
-        "Increased Power", "Power Description", "Failing Time", "Notes",
+        "Increased Power", "Power Description", "Failing Time", "Notes", "Source File",
     ], tid_rows)
 
     # ── SEE Data ──
@@ -667,13 +667,13 @@ def build_spreadsheet(results: list[dict], output_path: str):
                     safe(test.get("cross_section_saturation")),
                     safe(test.get("cross_section_threshold")),
                     safe(test.get("cross_section_type")),
-                    safe(test.get("special_notes")),
+                    safe(test.get("special_notes")), r["filename"],
                 ])
     write_sheet(ws_see, [
         "Paper", "Year", "Part", "Source", "SEE Type", "Max Fluence", "Energy",
         "Facility", "Environment", "Terrestrial", "Flight",
         "Amplitude", "Duration",
-        "Cross-Section Sat.", "Cross-Section Thresh.", "Cross-Section Type", "Notes",
+        "Cross-Section Sat.", "Cross-Section Thresh.", "Cross-Section Type", "Notes", "Source File",
     ], see_rows)
 
     # ── DD Data ──
@@ -692,12 +692,12 @@ def build_spreadsheet(results: list[dict], output_path: str):
                     safe(test.get("facility_name")), safe(test.get("environmental_conditions")),
                     safe(test.get("terrestrial")), safe(test.get("flight")),
                     safe(test.get("damage_level")), safe(test.get("damage_description")),
-                    safe(test.get("special_notes")),
+                    safe(test.get("special_notes")), r["filename"],
                 ])
     write_sheet(ws_dd, [
         "Paper", "Year", "Part", "Source", "Max Fluence", "Energy",
         "Facility", "Environment", "Terrestrial", "Flight",
-        "Damage Level", "Damage Description", "Notes",
+        "Damage Level", "Damage Description", "Notes", "Source File",
     ], dd_rows)
 
     # ── All Tests (flat) ──
@@ -714,12 +714,12 @@ def build_spreadsheet(results: list[dict], output_path: str):
                     safe(test.get("facility_name")), safe(test.get("max_fluence")),
                     safe(test.get("energy_levels")), safe(test.get("environmental_conditions")),
                     safe(test.get("terrestrial")), safe(test.get("flight")),
-                    safe(test.get("special_notes")),
+                    safe(test.get("special_notes")), r["filename"],
                 ])
     write_sheet(ws_all, [
         "Paper", "Year", "Part", "Manufacturer", "Test Type", "Source",
         "Facility", "Max Fluence", "Energy", "Environment",
-        "Terrestrial", "Flight", "Notes",
+        "Terrestrial", "Flight", "Notes", "Source File",
     ], flat_rows)
 
     # ── Parametric Data ──
@@ -738,12 +738,12 @@ def build_spreadsheet(results: list[dict], output_path: str):
                         safe(test.get("test_type")),
                         normalize_parametric(p.get("parameter")), safe(p.get("label")),
                         safe(p.get("pre")), safe(p.get("post")), safe(p.get("at_dose")),
-                        safe(p.get("spec_limit")), safe(p.get("notes")),
+                        safe(p.get("spec_limit")), safe(p.get("notes")), r["filename"],
                     ])
     write_sheet(ws_param, [
         "Paper", "Year", "Part", "Part Type", "Test Type",
         "Parameter", "Label in Paper", "Pre-Rad", "Post-Rad", "At Dose/Fluence",
-        "Spec Limit", "Notes",
+        "Spec Limit", "Notes", "Source File",
     ], param_rows)
 
     data_sheets = [ws_tid, ws_see, ws_dd, ws_all, ws_param]
@@ -764,7 +764,7 @@ def build_spreadsheet(results: list[dict], output_path: str):
                     safe(x.get("label")), safe(x.get("unit")), safe(x.get("scale")),
                     safe(y.get("label")), safe(y.get("unit")), safe(y.get("scale")),
                     len(series), sum(len(s["points"]) for s in series),
-                    safe(a.get("notes")), fig["image_path"],
+                    safe(a.get("notes")), fig["image_path"], r["filename"],
                 ])
                 for s in series:
                     for px, py in s["points"]:
@@ -772,12 +772,12 @@ def build_spreadsheet(results: list[dict], output_path: str):
                             safe(d.get("paper_name")), fig["figure_id"],
                             safe(a.get("related_part")), s["label"],
                             px, safe(x.get("label")), safe(x.get("unit")),
-                            py, safe(y.get("label")), safe(y.get("unit")),
+                            py, safe(y.get("label")), safe(y.get("unit")), r["filename"],
                         ])
         write_sheet(ws_figs, [
             "Paper", "Figure", "Page", "Caption", "Kind", "Related Part",
             "X Label", "X Unit", "X Scale", "Y Label", "Y Unit", "Y Scale",
-            "# Series", "# Points", "Notes", "Image",
+            "# Series", "# Points", "Notes", "Image", "Source File",
         ], fig_rows)
         # Make the image path clickable
         for row in ws_figs.iter_rows(min_row=2, min_col=16, max_col=16):
@@ -786,7 +786,7 @@ def build_spreadsheet(results: list[dict], output_path: str):
         ws_points = wb.create_sheet("Figure Data")
         write_sheet(ws_points, [
             "Paper", "Figure", "Related Part", "Series",
-            "X", "X Label", "X Unit", "Y", "Y Label", "Y Unit",
+            "X", "X Label", "X Unit", "Y", "Y Label", "Y Unit", "Source File",
         ], point_rows)
         data_sheets += [ws_figs, ws_points]
 
